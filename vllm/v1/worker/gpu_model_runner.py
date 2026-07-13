@@ -1175,6 +1175,15 @@ class GPUModelRunner(
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_dflash()
+            and hasattr(self, "drafter")
+            and hasattr(self.drafter, "clear_drafter_context_lens")
+        ):
+            self.drafter.clear_drafter_context_lens(
+                list(scheduler_output.finished_req_ids)
+            )
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -4452,6 +4461,11 @@ class GPUModelRunner(
         if common_attn_metadata is None:
             return False
         assert self.speculative_config is not None
+        # Prefill producer only materializes context KV (no query tokens).
+        if self.speculative_config.is_disagg_spec_producer():
+            return (
+                common_attn_metadata.max_seq_len <= self.effective_drafter_max_model_len
+            )
         # DFlash queries one extra token (the bonus token) beyond num_spec_tokens
         num_drafter_query_tokens = self.num_spec_tokens + (
             1 if self.speculative_config.use_dflash() else 0
@@ -5177,6 +5191,25 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
+            context_only = spec_config.is_disagg_spec_producer()
+            if (
+                spec_config.is_disagg_spec_consumer()
+                and isinstance(self.drafter, DFlashProposer)
+                and common_attn_metadata._num_computed_tokens_cpu is not None
+            ):
+                # Seed from connector-matched token counts so the consumer
+                # only appends context for newly generated tokens.
+                num_computed = (
+                    common_attn_metadata._num_computed_tokens_cpu[
+                        : common_attn_metadata.num_reqs
+                    ]
+                    .tolist()
+                )
+                self.drafter.seed_drafter_context_lens(
+                    self.input_batch.req_ids[: common_attn_metadata.num_reqs],
+                    num_computed,
+                )
+
             draft_token_ids = self.drafter.propose(
                 num_speculative_tokens=num_spec_tokens_to_schedule,
                 target_token_ids=target_token_ids,
@@ -5189,7 +5222,24 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
+                context_only=context_only,
             )
+            if (
+                not context_only
+                and isinstance(self.drafter, DFlashProposer)
+                and common_attn_metadata.num_reqs > 0
+            ):
+                # Each propose() appends context for the scheduled tokens.
+                qsl = common_attn_metadata.query_start_loc_cpu
+                if qsl is not None:
+                    new_ctx = [
+                        int(qsl[i + 1] - qsl[i])
+                        for i in range(common_attn_metadata.num_reqs)
+                    ]
+                    self.drafter.advance_drafter_context_lens(
+                        self.input_batch.req_ids[: common_attn_metadata.num_reqs],
+                        new_ctx,
+                    )
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
                 if draft_probs is not None:

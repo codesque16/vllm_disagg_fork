@@ -163,6 +163,20 @@ class SpeculativeConfig:
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
 
+    disagg_spec_role: Literal["producer", "consumer"] | None = None
+    """Role for P/D-disaggregated speculative decoding (Design A).
+
+    - ``producer``: build drafter context KV during prefill and skip draft
+      generation (prefill instance). Drafter + target KV are transferred via
+      the KV connector.
+    - ``consumer``: assume drafter context KV arrives via the KV connector and
+      resume drafting on decode (decode instance).
+    - ``None``: colocated / monolithic speculation (default).
+
+    Currently only validated for ``method='dflash'``. Requires a
+    ``kv_transfer_config`` on the engine (checked in ``VllmConfig``).
+    """
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""
@@ -1186,6 +1200,18 @@ class SpeculativeConfig:
 
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
+
+        if self.disagg_spec_role is not None:
+            if self.method != "dflash":
+                raise ValueError(
+                    "disagg_spec_role is currently only supported with "
+                    f"method='dflash' (got method={self.method!r})."
+                )
+            if self.disagg_spec_role not in ("producer", "consumer"):
+                raise ValueError(
+                    "disagg_spec_role must be 'producer', 'consumer', or None; "
+                    f"got {self.disagg_spec_role!r}."
+                )
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):
@@ -1245,6 +1271,12 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def is_disagg_spec_producer(self) -> bool:
+        return self.disagg_spec_role == "producer"
+
+    def is_disagg_spec_consumer(self) -> bool:
+        return self.disagg_spec_role == "consumer"
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"

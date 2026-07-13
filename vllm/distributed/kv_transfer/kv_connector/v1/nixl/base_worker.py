@@ -1795,9 +1795,22 @@ class NixlBaseConnectorWorker:
         # replication caps per-rank heads at 1 when tp > total_kv_heads
         # (issue #45330). Mamba uses the ssm_sizes counterpart, so skip here.
         if not self._has_mamba:
-            assert len(self.block_len_per_layer) == len(nixl_agent_meta.block_lens), (
-                "Number of KV layers must match between prefill and decode"
-            )
+            if len(self.block_len_per_layer) != len(nixl_agent_meta.block_lens):
+                local_n = len(self.block_len_per_layer)
+                remote_n = len(nixl_agent_meta.block_lens)
+                hint = ""
+                if self.vllm_config.speculative_config is not None:
+                    hint = (
+                        " If using disaggregated speculative decoding (e.g. "
+                        "DFlash), both prefill and decode must load the same "
+                        "target+drafter models and identical "
+                        "--speculative-config so KV cache group layouts match "
+                        "(including the drafter context group)."
+                    )
+                raise AssertionError(
+                    "Number of KV layers/regions must match between prefill "
+                    f"and decode (local={local_n}, remote={remote_n}).{hint}"
+                )
             model_replicated = self.use_mla or self.transfer_topo.is_kv_replicated(
                 remote_engine_id
             )

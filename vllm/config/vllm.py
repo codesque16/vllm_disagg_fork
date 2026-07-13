@@ -1541,6 +1541,25 @@ class VllmConfig:
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
 
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.disagg_spec_role is not None
+        ):
+            if (
+                self.kv_transfer_config is None
+                or not self.kv_transfer_config.is_kv_transfer_instance
+            ):
+                raise ValueError(
+                    "disagg_spec_role requires a KV transfer connector "
+                    "(set --kv-transfer-config with a kv_connector). "
+                    "Design A ships drafter context KV alongside target KV."
+                )
+            logger.info_once(
+                "Disagg speculative decoding enabled: role=%s method=%s",
+                self.speculative_config.disagg_spec_role,
+                self.speculative_config.method,
+            )
+
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
         #   disables it

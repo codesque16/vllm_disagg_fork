@@ -83,6 +83,35 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
+        # Per-request count of tokens whose drafter context K/V is already
+        # present (locally built or received via KV transfer). Used by the
+        # Design A consumer path to append only new-token context.
+        self._drafter_context_lens: dict[str, int] = {}
+
+    def seed_drafter_context_lens(
+        self, req_ids: list[str], num_computed_tokens: list[int]
+    ) -> None:
+        """Seed context lengths from connector-matched tokens (consumer)."""
+        for req_id, n in zip(req_ids, num_computed_tokens):
+            if n <= 0:
+                continue
+            if req_id not in self._drafter_context_lens:
+                self._drafter_context_lens[req_id] = int(n)
+
+    def clear_drafter_context_lens(self, req_ids: list[str]) -> None:
+        for req_id in req_ids:
+            self._drafter_context_lens.pop(req_id, None)
+
+    def advance_drafter_context_lens(
+        self, req_ids: list[str], num_new_context_tokens: list[int]
+    ) -> None:
+        for req_id, n in zip(req_ids, num_new_context_tokens):
+            if n <= 0:
+                continue
+            self._drafter_context_lens[req_id] = (
+                self._drafter_context_lens.get(req_id, 0) + int(n)
+            )
+
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # PIECEWISE cudagraphs are not supported for dflash
         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
@@ -276,6 +305,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        context_only: bool = False,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
@@ -304,6 +334,21 @@ class DFlashSpeculator(DraftModelSpeculator):
             seeds,
         )
 
+        if context_only:
+            # Prefill producer (Design A): materialize drafter context KV and
+            # skip query drafting so NIXL can transfer both KV groups.
+            self._materialize_context_kv(
+                input_batch,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                num_target_tokens,
+                num_query_per_req=0,
+            )
+            self.draft_tokens[:num_reqs].zero_()
+            return self.draft_tokens[:num_reqs]
+
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
@@ -328,49 +373,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        # Support multiple draft KV cache groups by preparing inputs once for each
-        for i, gid in enumerate(self.draft_kv_cache_group_ids):
-            prepare_dflash_inputs(
-                self.input_buffers,
-                self.block_tables.slot_mappings[gid],
-                self.context_positions,
-                self._context_slot_mappings[i],
-                self.sample_indices,
-                self.sample_pos,
-                self.sample_idx_mapping,
-                input_batch,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                self.block_tables.input_block_tables[gid],
-                self.block_tables.kernel_block_sizes[gid],
-                self.parallel_drafting_token_id,
-                self.num_query_per_req,
-                self.num_speculative_steps,
-                self.max_num_reqs,
-                self.max_num_tokens,
-                self.max_model_len,
-                self.sample_from_anchor,
-            )
-
-        # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
-        # because the context shape varies per step. During dummy runs the block tables
-        # are placeholders, so we skip the cache write to avoid clobbering real entries.
-        # Each layer uses the context slots of its own kv-cache group.
-        if dummy_run:
-            context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
-        elif self._layer_group_idx is not None:
-            context_slots = [
-                self._context_slot_mappings[gidx][:num_target_tokens]
-                for gidx in self._layer_group_idx
-            ]
-        else:
-            context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
+        self._materialize_context_kv(
+            input_batch,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            num_target_tokens,
+            num_query_per_req=self.num_query_per_req,
+            skip_cache_write=dummy_run,
         )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
@@ -418,6 +429,64 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs]
+
+    def _materialize_context_kv(
+        self,
+        input_batch: InputBatch,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        num_target_tokens: int,
+        num_query_per_req: int,
+        skip_cache_write: bool = False,
+    ) -> None:
+        """Prepare context slot mappings and optionally write drafter context KV.
+
+        ``num_query_per_req=0`` skips query expansion (producer context-only path).
+        """
+        assert self.draft_kv_cache_group_id >= 0
+        num_spec_steps = 0 if num_query_per_req == 0 else self.num_speculative_steps
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            prepare_dflash_inputs(
+                self.input_buffers,
+                self.block_tables.slot_mappings[gid],
+                self.context_positions,
+                self._context_slot_mappings[i],
+                self.sample_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                input_batch,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.kernel_block_sizes[gid],
+                self.parallel_drafting_token_id,
+                num_query_per_req,
+                num_spec_steps,
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.max_model_len,
+                self.sample_from_anchor,
+            )
+
+        if skip_cache_write:
+            return
+
+        if self._layer_group_idx is not None:
+            context_slots: torch.Tensor | list[torch.Tensor | None] | None = [
+                self._context_slot_mappings[gidx][:num_target_tokens]
+                for gidx in self._layer_group_idx
+            ]
+        else:
+            context_slots = self._context_slot_mappings[0][:num_target_tokens]
+        self.model.precompute_and_store_context_kv(
+            self.hidden_states[:num_target_tokens],
+            self.context_positions[:num_target_tokens],
+            context_slots,
+        )
 
 
 @triton.jit

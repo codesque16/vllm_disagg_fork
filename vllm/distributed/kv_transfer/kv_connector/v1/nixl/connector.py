@@ -81,6 +81,14 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
+        # Keep verifier and drafter KV groups separate so Design A can
+        # transfer DFlash/EAGLE drafter context as its own group.
+        spec_config = self._vllm_config.speculative_config
+        if spec_config is not None and (
+            spec_config.use_dflash() or spec_config.disagg_spec_role is not None
+        ):
+            return False
+
         if any(
             [
                 isinstance(group.kv_cache_spec, MambaSpec)

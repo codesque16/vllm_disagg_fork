@@ -68,6 +68,7 @@ class BaseSpeculator(ABC):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        context_only: bool = False,
     ) -> torch.Tensor:
         pass
 

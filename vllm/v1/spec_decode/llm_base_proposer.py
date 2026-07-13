@@ -518,6 +518,7 @@ class SpecDecodeBaseProposer:
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
+        context_only: bool = False,
     ) -> torch.Tensor:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
@@ -541,6 +542,20 @@ class SpecDecodeBaseProposer:
                 target_hidden_states
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
+
+        # Prefill producer for Design A: materialize drafter context KV and
+        # skip draft generation (DFlash overrides this for a query-free path).
+        if context_only:
+            return self._propose_context_only(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                mm_embed_inputs=mm_embed_inputs,
+            )
 
         num_tokens, token_indices_to_sample, common_attn_metadata = (
             self.set_inputs_first_pass(
@@ -817,6 +832,70 @@ class SpecDecodeBaseProposer:
             common_attn_metadata.seq_lens_cpu_upper_bound += 1
 
         return positions
+
+    def _propose_context_only(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Build drafter KV for the prompt and return empty drafts.
+
+        Default path runs the first-pass forward (keeps EAGLE-style drafter KV
+        in sync) then returns an empty draft tensor. DFlash overrides this to
+        write context K/V without expanding query tokens.
+        """
+        batch_size = common_attn_metadata.batch_size()
+        num_tokens, token_indices_to_sample, common_attn_metadata = (
+            self.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=token_indices_to_sample,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
+        )
+        _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(
+            common_attn_metadata
+        )
+        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+            self._determine_batch_execution_and_padding(num_tokens)
+        )
+        model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
+            num_tokens, num_input_tokens, mm_embed_inputs
+        )
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            slot_mapping=self._get_slot_mapping(
+                slot_mapping_size, common_attn_metadata.slot_mapping
+            ),
+        ):
+            self.model(**model_kwargs)
+        return torch.empty(
+            batch_size,
+            0,
+            device=self.device,
+            dtype=torch.int64,
+        )
+
+    def get_draft_attn_layer_names(self) -> set[str]:
+        """Layer names belonging to the drafter KV cache group."""
+        return set(self._draft_attn_layer_names)
+
+    def get_draft_kv_cache_group_id(self) -> int:
+        """KV cache group id for the drafter (set during initialize_kv_cache)."""
+        return self.kv_cache_gid
 
     def set_inputs_first_pass(
         self,

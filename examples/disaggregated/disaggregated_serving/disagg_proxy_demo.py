@@ -29,7 +29,7 @@ import aiohttp
 import requests
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 logger = logging.getLogger()
@@ -80,6 +80,9 @@ class Proxy:
             else self.create_chat_completion
         )
         self.router.get("/status", response_class=JSONResponse)(self.get_status)
+        # vllm bench serve scrapes {base_url}/metrics for spec-decode acceptance.
+        # Forward to a decode instance (where DFlash drafting runs).
+        self.router.get("/metrics", response_class=PlainTextResponse)(self.get_metrics)
         self.router.post(
             "/instances/add", dependencies=[Depends(self.api_key_authenticate)]
         )(self.add_instance_endpoint)
@@ -246,6 +249,28 @@ class Proxy:
             "decode_nodes": self.decode_instances,
         }
         return status
+
+    async def get_metrics(self):
+        """Proxy Prometheus metrics from a decode engine (spec-decode lives there)."""
+        if not self.decode_instances:
+            raise HTTPException(status_code=503, detail="No decode instances configured")
+        decode_instance = self.decode_instances[0]
+        url = f"http://{decode_instance}/metrics"
+        try:
+            async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as client:
+                async with client.get(url) as response:
+                    text = await response.text()
+                    return PlainTextResponse(
+                        content=text,
+                        status_code=response.status,
+                        media_type=response.headers.get(
+                            "content-type", "text/plain; version=0.0.4"
+                        ),
+                    )
+        except aiohttp.ClientError as e:
+            raise HTTPException(
+                status_code=502, detail=f"Failed to fetch metrics from {url}: {e}"
+            ) from e
 
     async def create_completion(self, raw_request: Request):
         try:

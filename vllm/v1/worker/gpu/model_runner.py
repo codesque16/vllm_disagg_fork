@@ -103,6 +103,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
@@ -748,6 +749,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        if (
+            isinstance(self.speculator, DFlashSpeculator)
+            and finished_req_ids
+        ):
+            self.speculator.clear_drafter_context_lens(list(finished_req_ids))
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 
@@ -1463,6 +1469,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+
+            # Design A: P/D-disaggregated DFlash.
+            # Producer materializes drafter context KV only (no drafts).
+            # Consumer seeds context lengths from connector-matched tokens.
+            context_only = False
+            if self.speculative_config is not None:
+                context_only = self.speculative_config.is_disagg_spec_producer()
+                if (
+                    self.speculative_config.is_disagg_spec_consumer()
+                    and isinstance(self.speculator, DFlashSpeculator)
+                    and input_batch.num_reqs > 0
+                ):
+                    self.speculator.seed_drafter_context_lens(
+                        input_batch.req_ids[: input_batch.num_reqs],
+                        input_batch.num_computed_tokens_np[
+                            : input_batch.num_reqs
+                        ].tolist(),
+                    )
+
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1476,8 +1501,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
+                context_only=context_only,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+
+            if (
+                not context_only
+                and isinstance(self.speculator, DFlashSpeculator)
+                and input_batch.num_reqs > 0
+            ):
+                qsl = input_batch.query_start_loc_np
+                new_ctx = [
+                    int(qsl[i + 1] - qsl[i]) for i in range(input_batch.num_reqs)
+                ]
+                self.speculator.advance_drafter_context_lens(
+                    input_batch.req_ids[: input_batch.num_reqs],
+                    new_ctx,
+                )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

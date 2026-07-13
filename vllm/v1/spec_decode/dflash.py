@@ -72,6 +72,100 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         self.dflash_causal = self.dflash_config.get("causal", False)
 
+        # Per-request count of tokens whose drafter context K/V is already
+        # present (locally built or received via KV transfer). Used by the
+        # Design A consumer path to append only new-token context.
+        self._drafter_context_lens: dict[str, int] = {}
+
+    def seed_drafter_context_lens(
+        self, req_ids: list[str], num_computed_tokens: list[int]
+    ) -> None:
+        """Seed context lengths from connector-matched tokens (consumer)."""
+        for req_id, n in zip(req_ids, num_computed_tokens):
+            if n <= 0:
+                continue
+            # Only seed once; subsequent steps append via propose().
+            if req_id not in self._drafter_context_lens:
+                self._drafter_context_lens[req_id] = int(n)
+
+    def clear_drafter_context_lens(self, req_ids: list[str]) -> None:
+        for req_id in req_ids:
+            self._drafter_context_lens.pop(req_id, None)
+
+    def advance_drafter_context_lens(
+        self, req_ids: list[str], num_new_context_tokens: list[int]
+    ) -> None:
+        for req_id, n in zip(req_ids, num_new_context_tokens):
+            if n <= 0:
+                continue
+            self._drafter_context_lens[req_id] = (
+                self._drafter_context_lens.get(req_id, 0) + int(n)
+            )
+
+    @override
+    def _propose_context_only(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Write DFlash context K/V for all prompt tokens; skip query draft."""
+        del token_indices_to_sample, mm_embed_inputs  # unused for context-only
+        batch_size = common_attn_metadata.batch_size()
+        num_context = target_token_ids.shape[0]
+        self._dflash_num_context = num_context
+        self._dflash_hidden_states = target_hidden_states
+
+        max_ctx_per_req = common_attn_metadata.max_query_len
+        BLOCK_SIZE = min(256, next_power_of_2(max(1, max_ctx_per_req)))
+        num_blocks = (max_ctx_per_req + BLOCK_SIZE - 1) // BLOCK_SIZE
+        grid = (batch_size, max(1, num_blocks))
+
+        has_num_rejected = num_rejected_tokens_gpu is not None
+        # num_query_per_req=0: only context positions/slots are written.
+        # Reuse positions buffer as a throwaway for the unused sample indices.
+        dummy_token_indices = self.positions[: max(1, batch_size)]
+        copy_and_expand_dflash_inputs_kernel[grid](
+            next_token_ids_ptr=next_token_ids,
+            target_positions_ptr=target_positions,
+            out_input_ids_ptr=self.input_ids,
+            out_context_positions_ptr=self._context_positions_buffer,
+            out_query_positions_ptr=self.positions,
+            out_context_slot_mapping_ptr=self._context_slot_mapping_buffer,
+            out_query_slot_mapping_ptr=self._slot_mapping_buffer,
+            out_token_indices_ptr=dummy_token_indices,
+            block_table_ptr=common_attn_metadata.block_table_tensor,
+            block_table_stride=common_attn_metadata.block_table_tensor.stride(0),
+            query_start_loc_ptr=common_attn_metadata.query_start_loc,
+            num_rejected_tokens_ptr=(
+                num_rejected_tokens_gpu if has_num_rejected else 0
+            ),
+            parallel_drafting_token_id=self.parallel_drafting_token_id,
+            block_size=self.block_size,
+            num_query_per_req=0,
+            num_speculative_tokens=0,
+            total_input_tokens=num_context,
+            BLOCK_SIZE=BLOCK_SIZE,
+            HAS_NUM_REJECTED=has_num_rejected,
+        )
+
+        self.model.precompute_and_store_context_kv(
+            self._dflash_hidden_states,
+            self._context_positions_buffer[:num_context],
+            self._context_slot_mapping_buffer[:num_context],
+        )
+        return torch.empty(
+            batch_size,
+            0,
+            device=self.device,
+            dtype=torch.int64,
+        )
+
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
