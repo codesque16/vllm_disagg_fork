@@ -82,10 +82,16 @@ class ZmqClientTransport(DisaggDFlashClientTransport):
     def speculate(
         self, request: DisaggDFlashSpeculateRequest
     ) -> DisaggDFlashSpeculateResponse:
-        frames = request.encode()
-        self._sock.send_multipart(frames)
-        resp_frames = self._sock.recv_multipart()
-        return DisaggDFlashSpeculateResponse.decode(resp_frames)
+        self.speculate_begin(request)
+        return self.speculate_wait()
+
+    def speculate_begin(self, request: DisaggDFlashSpeculateRequest) -> None:
+        """Send speculate frames; draft starts while caller does other work."""
+        self._sock.send_multipart(request.encode())
+
+    def speculate_wait(self) -> DisaggDFlashSpeculateResponse:
+        """Block until the draft replies to the in-flight speculate."""
+        return DisaggDFlashSpeculateResponse.decode(self._sock.recv_multipart())
 
     def free(self, request: DisaggDFlashFreeRequest) -> None:
         # Fire-and-forget: draft may be mid-speculate; don't fail verify on timeout.
@@ -108,9 +114,15 @@ class ZmqClientTransport(DisaggDFlashClientTransport):
         self._sock.close(linger=0)
 
     # Low-level access for CUDA IPC transport wrappers.
-    def send_recv(self, frames: list[bytes]) -> list[bytes]:
+    def send(self, frames: list[bytes]) -> None:
         self._sock.send_multipart(frames)
+
+    def recv(self) -> list[bytes]:
         return self._sock.recv_multipart()
+
+    def send_recv(self, frames: list[bytes]) -> list[bytes]:
+        self.send(frames)
+        return self.recv()
 
 
 class DisaggDFlashServerSocket:

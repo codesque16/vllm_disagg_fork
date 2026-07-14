@@ -8,6 +8,7 @@ import os
 from collections import deque
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -541,6 +542,7 @@ class DisaggDFlashDraftEngine:
         # list into every KV group (required for mixed Qwen3.5-DFlash).
         need_blocks = (needed_tokens + self.block_size - 1) // self.block_size
         have = len(state["blocks"])
+        changed = False
         if need_blocks > have:
             extra = need_blocks - have
             protected = protect if protect is not None else {req_id}
@@ -550,13 +552,20 @@ class DisaggDFlashDraftEngine:
                 self._reclaim_blocks(extra, protect=protected)
                 new_blocks = self.block_pool.allocate(extra)
             state["blocks"].extend(new_blocks)
+            changed = True
+        # Skip host→GPU rewrite when the block list is unchanged.
+        if not changed and state.get("bt_synced_n") == have:
+            return
+        blocks = state["blocks"]
+        n = len(blocks)
+        blocks_t = torch.as_tensor(blocks, dtype=torch.int32, device=self.device)
         n_groups = len(self.block_tables.block_tables)
         for gid in range(n_groups):
             bt = self.block_tables.block_tables[gid].gpu
-            for i, b in enumerate(state["blocks"]):
-                bt[slot, i] = b
-            self.block_tables.num_blocks.gpu[gid, slot] = len(state["blocks"])
-            self.block_tables.input_block_tables[gid][slot].copy_(bt[slot])
+            bt[slot, :n] = blocks_t
+            self.block_tables.num_blocks.gpu[gid, slot] = n
+            self.block_tables.input_block_tables[gid][slot, :n].copy_(blocks_t)
+        state["bt_synced_n"] = n
 
     def _slot_mapping_for_positions(
         self, slot: int, positions: torch.Tensor, group_id: int = 0
@@ -568,6 +577,19 @@ class DisaggDFlashDraftEngine:
         offsets = positions % bs
         return (block_ids.to(dtype=torch.int64) * bs + offsets).to(dtype=torch.int64)
 
+    @staticmethod
+    def _as_numpy_i64(t: torch.Tensor) -> np.ndarray:
+        """Host numpy view of a meta tensor (never .item() a CUDA tensor)."""
+        if t.is_cuda:
+            t = t.detach().cpu()
+        return np.asarray(t.numpy(), dtype=np.int64)
+
+    @staticmethod
+    def _as_numpy_i32(t: torch.Tensor) -> np.ndarray:
+        if t.is_cuda:
+            t = t.detach().cpu()
+        return np.asarray(t.numpy(), dtype=np.int32)
+
     @torch.inference_mode()
     def speculate(
         self, request: DisaggDFlashSpeculateRequest
@@ -575,14 +597,27 @@ class DisaggDFlashDraftEngine:
         num_reqs = len(request.req_ids)
         device = self.device
 
-        # Move tensors to GPU.
-        ctx_h = request.context_hiddens.to(device=device, dtype=self.dtype)
-        ctx_pos = request.context_positions.to(device=device, dtype=torch.int64)
-        qsl = request.query_start_loc.to(device=device, dtype=torch.int32)
-        num_rejected = request.num_rejected.to(device=device, dtype=torch.int32)
-        num_sampled = request.num_sampled.to(device=device, dtype=torch.int32)
-        last_sampled = request.last_sampled.to(device=device, dtype=torch.int64)
-        next_prefill = request.next_prefill_tokens.to(device=device, dtype=torch.int64)
+        # Hiddens / positions needed on GPU for KV write. Meta tensors stay on
+        # host — decoding already produced CPU tensors; uploading then .item()
+        # was the main draft-side latency tax at n≈64.
+        ctx_h = request.context_hiddens
+        if not ctx_h.is_cuda:
+            ctx_h = ctx_h.to(device=device, dtype=self.dtype, non_blocking=True)
+        else:
+            ctx_h = ctx_h.to(dtype=self.dtype)
+        ctx_pos = request.context_positions
+        if not ctx_pos.is_cuda:
+            ctx_pos_gpu = ctx_pos.to(device=device, dtype=torch.int64, non_blocking=True)
+            ctx_pos_np = self._as_numpy_i64(ctx_pos)
+        else:
+            ctx_pos_gpu = ctx_pos.to(dtype=torch.int64)
+            ctx_pos_np = self._as_numpy_i64(ctx_pos)
+
+        qsl_np = self._as_numpy_i32(request.query_start_loc)
+        num_rejected_np = self._as_numpy_i32(request.num_rejected)
+        num_sampled_np = self._as_numpy_i32(request.num_sampled)
+        last_sampled_np = self._as_numpy_i64(request.last_sampled)
+        next_prefill_np = self._as_numpy_i64(request.next_prefill_tokens)
 
         slots = [self._ensure_seq(rid) for rid in request.req_ids]
         self._tick += 1
@@ -598,36 +633,35 @@ class DisaggDFlashDraftEngine:
         context_slot_mapping = torch.zeros(
             ctx_h.shape[0], dtype=torch.int64, device=device
         )
-        last_valid_pos = torch.zeros(num_reqs, dtype=torch.int64, device=device)
+        last_valid_pos_np = np.zeros(num_reqs, dtype=np.int64)
 
         for i, req_id in enumerate(request.req_ids):
             state = self._seqs[req_id]
             slot = slots[i]
-            s = int(qsl[i].item())
-            e = int(qsl[i + 1].item())
-            n_rej = int(num_rejected[i].item())
+            s = int(qsl_np[i])
+            e = int(qsl_np[i + 1])
+            n_rej = int(num_rejected_np[i])
             valid_e = e - n_rej
             n_ctx = e - s
 
             if n_ctx > 0:
-                new_pos = ctx_pos[s:e]
-                max_pos = int(new_pos.max().item())
+                max_pos = int(ctx_pos_np[s:e].max())
                 self._ensure_blocks(
                     req_id,
                     max_pos + 1 + self.num_query_per_req,
                     protect=protect,
                 )
                 context_slot_mapping[s:e] = self._slot_mapping_for_positions(
-                    slot, new_pos
+                    slot, ctx_pos_gpu[s:e]
                 )
 
             if valid_e > s:
-                lv = int(ctx_pos[valid_e - 1].item())
-                last_valid_pos[i] = lv
+                lv = int(ctx_pos_np[valid_e - 1])
+                last_valid_pos_np[i] = lv
                 state["ctx_len"] = max(state["ctx_len"], lv + 1)
             else:
                 # No valid new context this step; keep prior length.
-                last_valid_pos[i] = max(0, state["ctx_len"] - 1)
+                last_valid_pos_np[i] = max(0, state["ctx_len"] - 1)
 
         # Precompute context K/V for all scheduled context tokens (rejected
         # slots are overwritten; query placement ignores them via last_valid_pos).
@@ -638,21 +672,26 @@ class DisaggDFlashDraftEngine:
                     context_slot_mapping
                 )
             else:
-                # Per-group slot maps (mirrored when block sizes match).
-                group_slots = []
-                for gid in range(n_groups):
-                    sm = torch.zeros(
-                        ctx_h.shape[0], dtype=torch.int64, device=device
-                    )
-                    for i, req_id in enumerate(request.req_ids):
-                        slot = slots[i]
-                        s = int(qsl[i].item())
-                        e = int(qsl[i + 1].item())
-                        if e > s:
-                            sm[s:e] = self._slot_mapping_for_positions(
-                                slot, ctx_pos[s:e], group_id=gid
-                            )
-                    group_slots.append(sm)
+                # Same page size across groups → reuse group-0 slot map.
+                # (Qwen3.5-DFlash mirrors one physical block list into every group.)
+                same_bs = len({int(b) for b in self.block_tables.block_sizes}) == 1
+                if same_bs:
+                    group_slots = [context_slot_mapping] * n_groups
+                else:
+                    group_slots = []
+                    for gid in range(n_groups):
+                        sm = torch.zeros(
+                            ctx_h.shape[0], dtype=torch.int64, device=device
+                        )
+                        for i, req_id in enumerate(request.req_ids):
+                            slot = slots[i]
+                            s = int(qsl_np[i])
+                            e = int(qsl_np[i + 1])
+                            if e > s:
+                                sm[s:e] = self._slot_mapping_for_positions(
+                                    slot, ctx_pos_gpu[s:e], group_id=gid
+                                )
+                        group_slots.append(sm)
                 # Map each draft attention layer to its KV group.
                 layer_names = []
                 if hasattr(self.model, "get_draft_kv_cache_layer_names"):
@@ -676,11 +715,11 @@ class DisaggDFlashDraftEngine:
                 ]
             self.model.precompute_and_store_context_kv(
                 ctx_h,
-                ctx_pos,
+                ctx_pos_gpu,
                 context_slots,
             )
 
-        # Build query tokens: bonus + mask tokens.
+        # Build query tokens: bonus + mask tokens (batched GPU fills).
         num_query = num_reqs * self.num_query_per_req
         vocab_size = int(self.embed_vocab_size)
         mask_id = int(self.parallel_drafting_token_id)
@@ -697,49 +736,50 @@ class DisaggDFlashDraftEngine:
         )
         positions = torch.zeros(num_query, dtype=torch.int64, device=device)
         query_slot_mapping = torch.zeros(num_query, dtype=torch.int64, device=device)
-        seq_lens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+        seq_lens_np = np.zeros(num_reqs, dtype=np.int32)
 
+        # Bonus selection on host (meta is already CPU).
+        bonus_np = np.where(
+            num_sampled_np[:num_reqs] > 0,
+            last_sampled_np[:num_reqs],
+            next_prefill_np[:num_reqs],
+        ).astype(np.int64, copy=False)
+        oob = (bonus_np < 0) | (bonus_np >= vocab_size)
+        if np.any(oob):
+            for i in np.nonzero(oob)[0].tolist():
+                logger.warning(
+                    "Disagg-DFlash draft: OOB bonus token %d (req=%s, vocab=%d); "
+                    "clamping into [0, %d]",
+                    int(bonus_np[i]),
+                    request.req_ids[i],
+                    vocab_size,
+                    vocab_size - 1,
+                )
+                bonus_np[i] = 0 if bonus_np[i] < 0 else vocab_size - 1
+
+        q_offsets = torch.arange(
+            self.num_query_per_req, device=device, dtype=torch.int64
+        )
+        max_pos_cap = self.max_model_len - 1
+        max_pos_cap_t = torch.tensor(max_pos_cap, device=device)
         for i, req_id in enumerate(request.req_ids):
             state = self._seqs[req_id]
             slot = slots[i]
             base = i * self.num_query_per_req
-            if int(num_sampled[i].item()) > 0:
-                bonus = int(last_sampled[i].item())
-            else:
-                bonus = int(next_prefill[i].item())
-            # Never substitute mask_token_id for a bad bonus — that collapses
-            # acceptance to ~0. Clamp into embed range as a last resort.
-            if bonus < 0 or bonus >= vocab_size:
-                logger.warning(
-                    "Disagg-DFlash draft: OOB bonus token %d (req=%s, vocab=%d); "
-                    "clamping into [0, %d]",
-                    bonus,
-                    req_id,
-                    vocab_size,
-                    vocab_size - 1,
-                )
-                bonus = 0 if bonus < 0 else vocab_size - 1
-            input_ids[base] = bonus
-            # Query sits at last_valid_pos+1 .. +K (same as colocated kernel).
-            lv = int(last_valid_pos[i].item())
-            qpos = torch.arange(
-                lv + 1,
-                lv + 1 + self.num_query_per_req,
-                device=device,
-                dtype=torch.int64,
-            )
-            qpos = torch.minimum(
-                qpos, torch.tensor(self.max_model_len - 1, device=device)
-            )
-            positions[base : base + self.num_query_per_req] = qpos
+            input_ids[base] = int(bonus_np[i])
+            lv = int(last_valid_pos_np[i])
             self._ensure_blocks(
                 req_id, lv + 1 + self.num_query_per_req, protect=protect
             )
+            qpos = torch.minimum(lv + 1 + q_offsets, max_pos_cap_t)
+            positions[base : base + self.num_query_per_req] = qpos
             query_slot_mapping[base : base + self.num_query_per_req] = (
                 self._slot_mapping_for_positions(slot, qpos)
             )
-            seq_lens[i] = lv + 1 + self.num_query_per_req
+            seq_lens_np[i] = lv + 1 + self.num_query_per_req
             state["ctx_len"] = max(state["ctx_len"], lv + 1)
+
+        seq_lens = torch.as_tensor(seq_lens_np, device=device, dtype=torch.int32)
 
         self.input_buffers.input_ids[:num_query].copy_(input_ids)
         self.input_buffers.positions[:num_query].copy_(positions)
@@ -756,7 +796,7 @@ class DisaggDFlashDraftEngine:
         query_start_loc_cpu = (
             torch.arange(num_reqs + 1, dtype=torch.int32) * self.num_query_per_req
         )
-        max_seq_len = int(seq_lens.max().item()) if num_reqs > 0 else 1
+        max_seq_len = int(seq_lens_np.max()) if num_reqs > 0 else 1
 
         # Per-layer causal when draft has mixed SWA/full attention.
         causal: bool | dict[int, bool] = self.dflash_causal
@@ -781,7 +821,7 @@ class DisaggDFlashDraftEngine:
         # any FREE/reuse they are not dense at the front. Using bt[:num_reqs]
         # made attention page in zeros while K/V lived on the real slot rows →
         # ~0% acceptance despite valid drafts flowing.
-        slot_idx = torch.tensor(slots, device=device, dtype=torch.long)
+        slot_idx = torch.as_tensor(slots, device=device, dtype=torch.long)
         attn_block_tables = [
             bt.index_select(0, slot_idx)
             for bt in self.block_tables.input_block_tables
@@ -822,11 +862,17 @@ class DisaggDFlashDraftEngine:
             )
 
         # Sample from mask-token positions (skip bonus at offset 0).
-        sample_idx = []
-        for i in range(num_reqs):
-            base = i * self.num_query_per_req
-            sample_idx.extend(range(base + 1, base + self.num_query_per_req))
-        sample_idx_t = torch.tensor(sample_idx, device=device, dtype=torch.long)
+        if num_reqs > 0:
+            bases = (
+                torch.arange(num_reqs, device=device, dtype=torch.long)
+                * self.num_query_per_req
+            )
+            offs = torch.arange(
+                1, self.num_query_per_req, device=device, dtype=torch.long
+            )
+            sample_idx_t = (bases.unsqueeze(1) + offs).reshape(-1)
+        else:
+            sample_idx_t = torch.empty(0, device=device, dtype=torch.long)
         logits = self.model.compute_logits(hidden[sample_idx_t])
         tokens = logits.argmax(dim=-1).view(num_reqs, self.num_speculative_tokens)
         self.draft_tokens[:num_reqs].copy_(tokens)

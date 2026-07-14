@@ -103,6 +103,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.spec_decode.disagg_dflash.proxy import DisaggDFlashProxy
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
@@ -1141,6 +1142,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            # Cross-step Disagg-DFlash: finish previous fire before FREE /
+            # prepare_inputs so draft tokens land in fire-time req slots.
+            if isinstance(self.speculator, DisaggDFlashProxy):
+                self.speculator.drain_deferred(self.req_states)
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1423,6 +1428,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
             )
 
+        # Stage 2 Disagg-DFlash: fire remote speculate before prompt_logprobs /
+        # AsyncOutput / postprocess so that work runs under the draft RTT.
+        disagg_pending = None
+        if isinstance(self.speculator, DisaggDFlashProxy):
+            assert self.sampler is not None
+            spec_hidden_states = hidden_states
+            if hasattr(self.model, "get_mtp_target_hidden_states"):
+                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            # Pass sampler output (batch-local) so bonus tokens do not depend on
+            # postprocess updating req_states.last_sampled_tokens.
+            disagg_pending = self.speculator.propose_begin(
+                input_batch,
+                attn_metadata,
+                slot_mappings_by_layer,
+                spec_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                sampler_output.sampled_token_ids,
+                self.req_states.next_prefill_tokens,
+                self.sampler.sampling_states.temperature.gpu,
+                self.sampler.sampling_states.seeds.gpu,
+            )
+
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
@@ -1474,7 +1504,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        if disagg_pending is not None:
+            assert isinstance(self.speculator, DisaggDFlashProxy)
+            # Cross-step: defer wait into next execute_model so draft RTT
+            # overlaps EngineCore schedule + execute preamble. Skip for
+            # structured outputs (scheduler needs real draft ids now).
+            defer = (
+                self.speculator.cross_step_enabled
+                and not disagg_pending.early_done
+                and not input_batch.has_structured_output_reqs
+            )
+            if defer:
+                self.speculator.defer_pending(disagg_pending)
+            else:
+                draft_tokens = self.speculator.propose_finish(disagg_pending)
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+        elif self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The

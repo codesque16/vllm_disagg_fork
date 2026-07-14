@@ -90,5 +90,13 @@ Omit `disagg_dflash_address` — same as stock DFlash.
 - Same-node TCP is fine for the control plane.
 - Profiling (verify TP0): `VLLM_DISAGG_DFLASH_PROFILE=1` logs projector /
   IPC / ZMQ RTT / broadcast ms every `VLLM_DISAGG_DFLASH_PROFILE_EVERY`
-  steps (default 50).
+  steps (default 50). Includes `verify_overlap_ms` (post-sample work under
+  the draft wait) and residual `await_ms`.
+- Verify fires the draft RPC before prompt-logprobs / AsyncOutput /
+  postprocess so that work overlaps the ZMQ RTT (Stage 2).
+- Draft engine keeps speculate meta on CPU (no per-req CUDA `.item()` syncs)
+  and vectorizes block-table updates.
+- Cross-step pipeline (optional): `VLLM_DISAGG_DFLASH_CROSS_STEP=1` defers
+  `propose_finish` into the next `execute_model` so draft RTT overlaps
+  schedule / prepare (disabled for structured-output batches).
 - Experimental; validate acceptance length vs colocated DFlash before production use.

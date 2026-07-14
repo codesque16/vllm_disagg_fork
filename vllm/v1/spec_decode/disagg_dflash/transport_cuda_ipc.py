@@ -303,6 +303,7 @@ class CudaIpcClientTransport(DisaggDFlashClientTransport):
         self._token_ready = torch.cuda.Event(enable_timing=False)
         # Filled by speculate() for optional profiling.
         self.last_timings_ms: dict[str, float] = {}
+        self._inflight: dict[str, Any] | None = None
 
     def handshake(self) -> None:
         if self._handshook:
@@ -342,6 +343,11 @@ class CudaIpcClientTransport(DisaggDFlashClientTransport):
     def speculate(
         self, request: DisaggDFlashSpeculateRequest
     ) -> DisaggDFlashSpeculateResponse:
+        self.speculate_begin(request)
+        return self.speculate_wait()
+
+    def speculate_begin(self, request: DisaggDFlashSpeculateRequest) -> None:
+        """Publish hiddens + send ZMQ meta; draft runs while caller overlaps."""
         if not self._handshook:
             self.handshake()
 
@@ -400,10 +406,36 @@ class CudaIpcClientTransport(DisaggDFlashClientTransport):
         self._hidden_ready.synchronize()
         t2 = time.perf_counter() if profile else 0.0
 
-        resp_frames = self._zmq.send_recv(frames)
-        t3 = time.perf_counter() if profile else 0.0
+        self._zmq.send(frames)
+        t_send = time.perf_counter() if profile else 0.0
 
         k = int(request.num_speculative_tokens)
+        self._inflight = {
+            "num_reqs": num_reqs,
+            "k": k,
+            "profile": profile,
+            "t0": t0,
+            "t1": t1,
+            "t2": t2,
+            "t_send": t_send,
+        }
+
+    def speculate_wait(self) -> DisaggDFlashSpeculateResponse:
+        """Recv ZMQ ack + pull tokens from IPC staging."""
+        inflight = getattr(self, "_inflight", None)
+        if inflight is None:
+            raise RuntimeError(
+                "Disagg-DFlash CUDA IPC speculate_wait without speculate_begin"
+            )
+        self._inflight = None
+
+        num_reqs = int(inflight["num_reqs"])
+        k = int(inflight["k"])
+        profile = bool(inflight["profile"])
+
+        resp_frames = self._zmq.recv()
+        t3 = time.perf_counter() if profile else 0.0
+
         out = torch.empty(num_reqs, k, dtype=torch.int64, device=self.device)
         tok_nbytes = num_reqs * k * out.element_size()
         memcpy_d2d_async(
@@ -420,10 +452,16 @@ class CudaIpcClientTransport(DisaggDFlashClientTransport):
             draft_tokens=torch.empty(num_reqs, k, dtype=torch.int64),
         )
         if profile:
+            t0 = float(inflight["t0"])
+            t1 = float(inflight["t1"])
+            t2 = float(inflight["t2"])
+            t_send = float(inflight["t_send"])
             self.last_timings_ms = {
                 "ipc_prep_ms": (t1 - t0) * 1000.0,
                 "ipc_hidden_wait_ms": (t2 - t1) * 1000.0,
+                "zmq_send_ms": (t_send - t2) * 1000.0,
                 "zmq_rtt_ms": (t3 - t2) * 1000.0,
+                "zmq_recv_ms": (t3 - t_send) * 1000.0,
                 "ipc_token_wait_ms": (t4 - t3) * 1000.0,
                 "ipc_total_ms": (t4 - t0) * 1000.0,
             }

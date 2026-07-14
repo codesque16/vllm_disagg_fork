@@ -39,6 +39,32 @@ class DisaggDFlashClientTransport(ABC):
     ) -> DisaggDFlashSpeculateResponse:
         ...
 
+    def speculate_begin(self, request: DisaggDFlashSpeculateRequest) -> None:
+        """Send/start speculate so the caller can overlap other work.
+
+        Default falls back to buffering the request for ``speculate_wait``.
+        ZMQ / CUDA IPC override this to avoid a host-side stall on send+recv.
+        """
+        self._buffered_speculate = request  # type: ignore[attr-defined]
+
+    def speculate_wait(self) -> "DisaggDFlashSpeculateResponse":
+        """Complete an in-flight speculate started by ``speculate_begin``."""
+        request = getattr(self, "_buffered_speculate", None)
+        if request is None:
+            raise RuntimeError(
+                "Disagg-DFlash speculate_wait without matching speculate_begin"
+            )
+        self._buffered_speculate = None  # type: ignore[attr-defined]
+        # Call the transport's blocking path; subclasses that override
+        # speculate_begin must also override speculate_wait.
+        return self._speculate_blocking(request)
+
+    def _speculate_blocking(
+        self, request: DisaggDFlashSpeculateRequest
+    ) -> "DisaggDFlashSpeculateResponse":
+        """Blocking speculate used by the default begin/wait pair."""
+        return self.speculate(request)
+
     @abstractmethod
     def free(self, request: DisaggDFlashFreeRequest) -> None:
         ...
