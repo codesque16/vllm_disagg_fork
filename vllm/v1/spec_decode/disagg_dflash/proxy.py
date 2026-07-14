@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Any
 
 import torch
@@ -36,6 +38,10 @@ from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
 logger = init_logger(__name__)
 
 
+def _profile_enabled() -> bool:
+    return os.environ.get("VLLM_DISAGG_DFLASH_PROFILE", "0") == "1"
+
+
 class DisaggDFlashProxy(BaseSpeculator):
     """Remote DFlash drafter. Does not load draft transformer weights."""
 
@@ -56,6 +62,10 @@ class DisaggDFlashProxy(BaseSpeculator):
         self._projector: nn.Module | None = None
         self._known_req_ids: set[str] = set()
         self._transport_name = self.speculative_config.disagg_dflash_transport
+        self._profile_steps = 0
+        self._profile_every = int(
+            os.environ.get("VLLM_DISAGG_DFLASH_PROFILE_EVERY", "50")
+        )
 
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
@@ -159,6 +169,8 @@ class DisaggDFlashProxy(BaseSpeculator):
             return self.draft_tokens[:num_reqs].zero_()
 
         num_tokens = input_batch.num_tokens
+        profile = _profile_enabled() and self._tp_rank == 0
+        t_proj0 = time.perf_counter() if profile else 0.0
         reduced = reduce_aux_hidden_states(
             self._projector,
             last_hidden_states[:num_tokens],
@@ -168,12 +180,17 @@ class DisaggDFlashProxy(BaseSpeculator):
                 else None
             ),
         )
+        if profile:
+            # Ensure projector GPU work finished before measuring.
+            torch.cuda.synchronize()
+        t_proj1 = time.perf_counter() if profile else 0.0
 
         positions = input_batch.positions[:num_tokens]
 
         self._known_req_ids.update(req_ids)
 
         draft_tokens: torch.Tensor
+        speculate_ms: dict[str, float] = {}
         if self._tp_rank == 0:
             assert self._client is not None
             idx = input_batch.idx_mapping[:num_reqs].long()
@@ -241,6 +258,7 @@ class DisaggDFlashProxy(BaseSpeculator):
                     bonus[oob][:8].detach().tolist(),
                 )
 
+            t_pack0 = time.perf_counter() if profile else 0.0
             req = pack_speculate_request(
                 req_ids=req_ids,
                 reduced_hiddens=reduced,
@@ -264,10 +282,21 @@ class DisaggDFlashProxy(BaseSpeculator):
                 num_speculative_tokens=self.num_speculative_steps,
                 num_reqs=num_reqs,
             )
+            t_pack1 = time.perf_counter() if profile else 0.0
             resp = self._client.speculate(req)
+            t_spec1 = time.perf_counter() if profile else 0.0
             draft_tokens = resp.draft_tokens.to(
                 device=self.device, dtype=torch.int64, non_blocking=True
             )
+            if profile:
+                speculate_ms = {
+                    "projector_ms": (t_proj1 - t_proj0) * 1000.0,
+                    "pack_ms": (t_pack1 - t_pack0) * 1000.0,
+                    "speculate_ms": (t_spec1 - t_pack1) * 1000.0,
+                }
+                client_ms = getattr(self._client, "last_timings_ms", None)
+                if isinstance(client_ms, dict):
+                    speculate_ms.update(client_ms)
         else:
             draft_tokens = torch.empty(
                 num_reqs,
@@ -276,12 +305,26 @@ class DisaggDFlashProxy(BaseSpeculator):
                 device=self.device,
             )
 
+        t_bcast0 = time.perf_counter() if profile else 0.0
         if self._tp_size > 1:
             torch.distributed.broadcast(
                 draft_tokens,
                 src=get_tp_group().ranks[0],
                 group=get_tp_group().device_group,
             )
+        if profile:
+            torch.cuda.synchronize()
+            t_bcast1 = time.perf_counter()
+            speculate_ms["broadcast_ms"] = (t_bcast1 - t_bcast0) * 1000.0
+            speculate_ms["propose_total_ms"] = (t_bcast1 - t_proj0) * 1000.0
+            self._profile_steps += 1
+            if self._profile_steps % max(1, self._profile_every) == 0:
+                logger.info(
+                    "Disagg-DFlash profile (n=%d transport=%s): %s",
+                    num_reqs,
+                    self._transport_name,
+                    {k: round(v, 2) for k, v in speculate_ms.items()},
+                )
 
         self.draft_tokens[:num_reqs].copy_(draft_tokens[:num_reqs])
         return self.draft_tokens[:num_reqs]

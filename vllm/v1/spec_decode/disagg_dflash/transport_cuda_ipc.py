@@ -8,12 +8,17 @@ move via draft-owned ``cudaMalloc`` staging exported with ``cudaIpcGetMemHandle`
 Staging is allocated with the CUDA runtime allocator (not the PyTorch caching
 allocator) so IPC handles refer to the exact base pointer. Draft copies
 into/out of ordinary torch tensors around each speculate.
+
+Copies use ``cudaMemcpyAsync`` on a dedicated stream with CUDA events instead of
+full ``cudaDeviceSynchronize`` after every transfer.
 """
 
 from __future__ import annotations
 
 import base64
 import ctypes
+import os
+import time
 from typing import Any
 
 import torch
@@ -40,6 +45,7 @@ from vllm.v1.spec_decode.disagg_dflash.transport_zmq import ZmqClientTransport
 logger = init_logger(__name__)
 
 _ALIGN = 1 << 21  # 2 MiB — CUDA IPC allocation alignment
+_CUDA_MEMCPY_DEFAULT = 4
 
 
 def _aligned_nbytes(nbytes: int) -> int:
@@ -48,6 +54,10 @@ def _aligned_nbytes(nbytes: int) -> int:
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
+
+
+def _profile_enabled() -> bool:
+    return os.environ.get("VLLM_DISAGG_DFLASH_PROFILE", "0") == "1"
 
 
 def export_ipc_handle_ptr(ptr: int | ctypes.c_void_p) -> str:
@@ -92,13 +102,11 @@ def close_ipc_ptr(ptr: int) -> None:
         return
     try:
         lib = CudaRTLibrary()
-        # cudaIpcCloseMemHandle is not wrapped; call via ctypes if present.
         if "cudaIpcCloseMemHandle" in getattr(lib, "funcs", {}):
             lib.CUDART_CHECK(
                 lib.funcs["cudaIpcCloseMemHandle"](ctypes.c_void_p(ptr))
             )
         else:
-            # Best-effort: look up dynamically.
             f = getattr(lib.lib, "cudaIpcCloseMemHandle", None)
             if f is not None:
                 f.restype = ctypes.c_int
@@ -110,12 +118,43 @@ def close_ipc_ptr(ptr: int) -> None:
         logger.warning("cudaIpcCloseMemHandle failed: %s", e)
 
 
-def memcpy_d2d(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+def memcpy_d2d_async(
+    dst_ptr: int, src_ptr: int, nbytes: int, stream: torch.cuda.Stream | None = None
+) -> None:
+    """Device-to-device copy on ``stream`` (default stream if None). No device sync."""
     if nbytes <= 0:
         return
     lib = CudaRTLibrary()
-    lib.cudaMemcpy(ctypes.c_void_p(dst_ptr), ctypes.c_void_p(src_ptr), nbytes)
-    lib.cudaDeviceSynchronize()
+    stream_handle = 0 if stream is None else int(stream.cuda_stream)
+    f = getattr(lib.lib, "cudaMemcpyAsync", None)
+    if f is None:
+        # Fallback: synchronous memcpy (still no cudaDeviceSynchronize).
+        lib.cudaMemcpy(ctypes.c_void_p(dst_ptr), ctypes.c_void_p(src_ptr), nbytes)
+        return
+    f.restype = ctypes.c_int
+    f.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    err = f(
+        ctypes.c_void_p(dst_ptr),
+        ctypes.c_void_p(src_ptr),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(_CUDA_MEMCPY_DEFAULT),
+        ctypes.c_void_p(stream_handle),
+    )
+    if err != 0:
+        raise RuntimeError(f"cudaMemcpyAsync failed: err={err}")
+
+
+def memcpy_d2d(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """Compatibility helper: async copy on current stream + stream sync."""
+    stream = torch.cuda.current_stream()
+    memcpy_d2d_async(dst_ptr, src_ptr, nbytes, stream=stream)
+    stream.synchronize()
 
 
 class CudaIpcStaging:
@@ -140,6 +179,7 @@ class CudaIpcStaging:
         self.dtype = dtype
         self.device = device
         self._lib = CudaRTLibrary()
+        self._stream = torch.cuda.Stream(device=device)
 
         # Torch mirrors (caching allocator) — draft model reads/writes these.
         self.hidden_staging = torch.zeros(
@@ -185,11 +225,15 @@ class CudaIpcStaging:
             raise ValueError(f"num_ctx_tokens={n} out of range")
         nbytes = n * self.hidden_size * _dtype_nbytes(self.dtype)
         if n > 0:
-            memcpy_d2d(
+            # Wait for any prior default-stream work, then async pull + stream sync.
+            self._stream.wait_stream(torch.cuda.current_stream(self.device))
+            memcpy_d2d_async(
                 int(self.hidden_staging.data_ptr()),
                 self.hidden_ipc_ptr,
                 nbytes,
+                stream=self._stream,
             )
+            self._stream.synchronize()
         return self.hidden_staging[:n]
 
     def push_tokens_to_ipc(self, num_reqs: int) -> None:
@@ -199,11 +243,14 @@ class CudaIpcStaging:
             raise ValueError(f"num_reqs={n} out of range")
         nbytes = n * self.num_speculative_tokens * _dtype_nbytes(torch.int64)
         if n > 0:
-            memcpy_d2d(
+            self._stream.wait_stream(torch.cuda.current_stream(self.device))
+            memcpy_d2d_async(
                 self.token_ipc_ptr,
                 int(self.token_staging.data_ptr()),
                 nbytes,
+                stream=self._stream,
             )
+            self._stream.synchronize()
 
     def hello_payload(self) -> dict[str, Any]:
         return {
@@ -251,6 +298,11 @@ class CudaIpcClientTransport(DisaggDFlashClientTransport):
         self._token_ptr = 0
         self._dtype = torch.bfloat16
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        self._stream = torch.cuda.Stream(device=self.device)
+        self._hidden_ready = torch.cuda.Event(enable_timing=False)
+        self._token_ready = torch.cuda.Event(enable_timing=False)
+        # Filled by speculate() for optional profiling.
+        self.last_timings_ms: dict[str, float] = {}
 
     def handshake(self) -> None:
         if self._handshook:
@@ -293,6 +345,9 @@ class CudaIpcClientTransport(DisaggDFlashClientTransport):
         if not self._handshook:
             self.handshake()
 
+        profile = _profile_enabled()
+        t0 = time.perf_counter() if profile else 0.0
+
         hiddens = request.context_hiddens
         if not hiddens.is_cuda:
             hiddens = hiddens.to(device=self.device, non_blocking=True)
@@ -316,8 +371,13 @@ class CudaIpcClientTransport(DisaggDFlashClientTransport):
                 f"Hidden size mismatch: verify H={h}, draft staging H={self._hidden_size}"
             )
 
+        # Publish hiddens on IPC stream; overlap CPU encode with the copy.
+        self._stream.wait_stream(torch.cuda.current_stream(self.device))
         nbytes = n_ctx * self._hidden_size * hiddens.element_size()
-        memcpy_d2d(self._hidden_ptr, int(hiddens.data_ptr()), nbytes)
+        memcpy_d2d_async(
+            self._hidden_ptr, int(hiddens.data_ptr()), nbytes, stream=self._stream
+        )
+        self._hidden_ready.record(self._stream)
 
         ipc_req = DisaggDFlashSpeculateRequest(
             req_ids=request.req_ids,
@@ -333,17 +393,42 @@ class CudaIpcClientTransport(DisaggDFlashClientTransport):
             num_speculative_tokens=request.num_speculative_tokens,
             payload_mode=PAYLOAD_IPC,
         )
-        resp_frames = self._zmq.send_recv(ipc_req.encode())
+        frames = ipc_req.encode()
+
+        t1 = time.perf_counter() if profile else 0.0
+        # Must complete publish before draft pulls over ZMQ.
+        self._hidden_ready.synchronize()
+        t2 = time.perf_counter() if profile else 0.0
+
+        resp_frames = self._zmq.send_recv(frames)
+        t3 = time.perf_counter() if profile else 0.0
 
         k = int(request.num_speculative_tokens)
         out = torch.empty(num_reqs, k, dtype=torch.int64, device=self.device)
         tok_nbytes = num_reqs * k * out.element_size()
-        memcpy_d2d(int(out.data_ptr()), self._token_ptr, tok_nbytes)
+        memcpy_d2d_async(
+            int(out.data_ptr()), self._token_ptr, tok_nbytes, stream=self._stream
+        )
+        self._token_ready.record(self._stream)
+        self._token_ready.synchronize()
+        # Make tokens visible to default stream (NCCL broadcast).
+        torch.cuda.current_stream(self.device).wait_stream(self._stream)
+        t4 = time.perf_counter() if profile else 0.0
 
         DisaggDFlashSpeculateResponse.decode(
             resp_frames,
             draft_tokens=torch.empty(num_reqs, k, dtype=torch.int64),
         )
+        if profile:
+            self.last_timings_ms = {
+                "ipc_prep_ms": (t1 - t0) * 1000.0,
+                "ipc_hidden_wait_ms": (t2 - t1) * 1000.0,
+                "zmq_rtt_ms": (t3 - t2) * 1000.0,
+                "ipc_token_wait_ms": (t4 - t3) * 1000.0,
+                "ipc_total_ms": (t4 - t0) * 1000.0,
+            }
+        else:
+            self.last_timings_ms = {}
         return DisaggDFlashSpeculateResponse(
             draft_tokens=out, payload_mode=PAYLOAD_IPC
         )

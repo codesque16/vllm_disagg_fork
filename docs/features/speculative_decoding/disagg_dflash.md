@@ -88,4 +88,7 @@ Omit `disagg_dflash_address` — same as stock DFlash.
 - `cuda_ipc` requires the same host; draft `--transport` and verify
   `disagg_dflash_transport` must both be `cuda_ipc`.
 - Same-node TCP is fine for the control plane.
+- Profiling (verify TP0): `VLLM_DISAGG_DFLASH_PROFILE=1` logs projector /
+  IPC / ZMQ RTT / broadcast ms every `VLLM_DISAGG_DFLASH_PROFILE_EVERY`
+  steps (default 50).
 - Experimental; validate acceptance length vs colocated DFlash before production use.
