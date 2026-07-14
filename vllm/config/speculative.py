@@ -104,6 +104,35 @@ class SpeculativeConfig:
     """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
     warn users when they mistakenly provide the wrong argument."""
 
+    # Target↔drafter Disagg-DFlash (experimental). Orthogonal to Design A
+    # ``disagg_spec_role`` (P/D). When unset, colocated DFlash is unchanged.
+    disagg_dflash_address: str | None = None
+    """ZMQ address of a standalone DFlash draft server, e.g. ``tcp://127.0.0.1:50051``.
+    When set with ``method='dflash'``, the verify worker does not load DFlash weights;
+    it reduces aux hidden states locally and RPCs incremental context + speculate
+    to the draft server. Mutually exclusive with ``disagg_spec_role``."""
+    disagg_dflash_timeout_ms: int = Field(default=180_000, ge=1)
+    """Timeout in milliseconds for Disagg-DFlash ZMQ round-trips.
+
+    Default is generous so the first verify warmup can wait out draft-side
+    ``torch.compile`` / CUDA graph capture on a cold draft server."""
+    disagg_dflash_transport: Literal["zmq", "cuda_ipc", "nccl", "nixl"] = "zmq"
+    """Data-plane transport for Disagg-DFlash large tensors.
+
+    - ``zmq`` (default): tensors in multipart ZMQ frames (works cross-node).
+    - ``cuda_ipc``: same-node CUDA IPC staging for ``context_hiddens`` /
+      ``draft_tokens``; ZMQ remains the control plane. Draft and verify must
+      share a host with P2P/NVLink (or PCIe P2P) between TP0 and the draft GPU.
+    - ``nccl`` / ``nixl``: reserved stubs (not implemented yet).
+    """
+    disagg_dflash_ipc_max_num_tokens: int | None = Field(default=None, ge=1)
+    """Staging capacity (tokens) for ``cuda_ipc`` transport.
+
+    When ``None``, verify does not override draft sizing; the draft server
+    defaults to ``16384`` (or ``--ipc-max-num-tokens``). Set this to match
+    verify ``max_num_batched_tokens`` when batches can exceed the draft default.
+    """
+
     # Draft model configuration
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
@@ -1212,6 +1241,33 @@ class SpeculativeConfig:
                     "disagg_spec_role must be 'producer', 'consumer', or None; "
                     f"got {self.disagg_spec_role!r}."
                 )
+
+        if self.disagg_dflash_address is not None:
+            if self.method != "dflash":
+                raise ValueError(
+                    "disagg_dflash_address is only supported with method='dflash'. "
+                    f"Got method={self.method!r}."
+                )
+            if self.disagg_spec_role is not None:
+                raise ValueError(
+                    "disagg_dflash_address (target↔drafter) and disagg_spec_role "
+                    "(P/D Design A) are mutually exclusive."
+                )
+            transport = getattr(self, "disagg_dflash_transport", "zmq") or "zmq"
+            if transport in ("nccl", "nixl"):
+                raise ValueError(
+                    f"disagg_dflash_transport={transport!r} "
+                    "is reserved but not implemented. Use 'zmq' or 'cuda_ipc'."
+                )
+            if transport not in (
+                "zmq",
+                "cuda_ipc",
+                "nccl",
+                "nixl",
+            ):
+                raise ValueError(
+                    f"Unknown disagg_dflash_transport={transport!r}."
+                )
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):
@@ -1271,6 +1327,10 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_disagg_dflash(self) -> bool:
+        """True when DFlash drafting is offloaded to a remote draft server."""
+        return self.use_dflash() and bool(self.disagg_dflash_address)
 
     def is_disagg_spec_producer(self) -> bool:
         return self.disagg_spec_role == "producer"

@@ -1,0 +1,287 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Verify-side Disagg-DFlash proxy (Model Runner V2 / BaseSpeculator)."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_tp_group
+from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.disagg_dflash.common import pack_speculate_request
+from vllm.v1.spec_decode.disagg_dflash.projector import (
+    build_and_load_projector,
+    reduce_aux_hidden_states,
+)
+from vllm.v1.spec_decode.disagg_dflash.protocol import DisaggDFlashFreeRequest
+from vllm.v1.spec_decode.disagg_dflash.transport import (
+    DisaggDFlashClientTransport,
+    create_client_transport,
+)
+from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    AttentionStatePair,
+    BatchExecutionDescriptor,
+)
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
+
+logger = init_logger(__name__)
+
+
+class DisaggDFlashProxy(BaseSpeculator):
+    """Remote DFlash drafter. Does not load draft transformer weights."""
+
+    supports_mm_inputs = False
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        assert vllm_config.speculative_config is not None
+        assert vllm_config.speculative_config.use_disagg_dflash()
+        self.vllm_config = vllm_config
+        self.device = device
+        self.speculative_config = vllm_config.speculative_config
+        self.num_speculative_steps = self.speculative_config.num_speculative_tokens
+        self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+
+        self._tp_rank = get_tp_group().rank_in_group
+        self._tp_size = get_tp_group().world_size
+        self._client: DisaggDFlashClientTransport | None = None
+        self._projector: nn.Module | None = None
+        self._known_req_ids: set[str] = set()
+        self._transport_name = self.speculative_config.disagg_dflash_transport
+
+        self.draft_tokens = torch.zeros(
+            self.max_num_reqs,
+            self.num_speculative_steps,
+            dtype=torch.int64,
+            device=device,
+        )
+        # Token-only wire protocol: rejection sampling uses target logits only.
+        self.draft_logits: torch.Tensor | None = None
+        # Dummy attribute so isinstance(..., DraftModelSpeculator) paths skip us.
+        self.model = None
+
+    def load_model(self, target_model: nn.Module) -> None:
+        self._projector = build_and_load_projector(self.vllm_config, self.device)
+        if self._tp_rank == 0:
+            address = self.speculative_config.disagg_dflash_address
+            assert address is not None
+            self._client = create_client_transport(
+                address=address,
+                timeout_ms=self.speculative_config.disagg_dflash_timeout_ms,
+                transport=self._transport_name,
+                ipc_max_num_tokens=(
+                    self.speculative_config.disagg_dflash_ipc_max_num_tokens
+                ),
+            )
+            if not self._client.ping():
+                logger.warning(
+                    "Disagg-DFlash draft server did not answer ping at %s", address
+                )
+            self._client.handshake()
+        logger.info(
+            "Disagg-DFlash proxy ready (tp_rank=%d, address=%s, transport=%s)",
+            self._tp_rank,
+            self.speculative_config.disagg_dflash_address,
+            self._transport_name,
+        )
+
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        return
+
+    def capture(
+        self,
+        attn_states: dict[BatchExecutionDescriptor, AttentionStatePair],
+    ) -> None:
+        return
+
+    def set_attn(
+        self,
+        model_state: ModelState,
+        kv_cache_config: KVCacheConfig,
+        block_tables: BlockTables,
+    ) -> None:
+        return
+
+    def free_requests(self, req_ids: list[str]) -> None:
+        if not req_ids:
+            return
+        # Always notify draft for finished IDs we have seen; also drop unknown
+        # IDs from local tracking so verify-side set cannot grow unbounded.
+        to_free = [r for r in req_ids if r in self._known_req_ids]
+        for r in req_ids:
+            self._known_req_ids.discard(r)
+        if not to_free or self._tp_rank != 0 or self._client is None:
+            return
+        try:
+            self._client.free(DisaggDFlashFreeRequest(req_ids=to_free))
+        except Exception as e:
+            logger.warning("Disagg-DFlash FREE failed: %s", e)
+
+    @torch.inference_mode()
+    def propose(
+        self,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_tokens_across_dp: torch.Tensor | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        is_profile: bool = False,
+        context_only: bool = False,
+    ) -> torch.Tensor:
+        num_reqs = input_batch.num_reqs
+        # context_only is Design A (P/D); mutually exclusive with this proxy.
+        if dummy_run or is_profile or context_only:
+            return self.draft_tokens[:num_reqs].zero_()
+
+        req_ids = list(input_batch.req_ids[:num_reqs])
+        # Verify kernel warmup uses "_warmup_{i}_" IDs and historically only
+        # finished them via execute_model (no sample_tokens). Never allocate
+        # draft slots for those synthetic requests.
+        if any(rid.startswith("_warmup_") for rid in req_ids):
+            return self.draft_tokens[:num_reqs].zero_()
+
+        num_tokens = input_batch.num_tokens
+        reduced = reduce_aux_hidden_states(
+            self._projector,
+            last_hidden_states[:num_tokens],
+            (
+                [h[:num_tokens] for h in aux_hidden_states]
+                if aux_hidden_states is not None
+                else None
+            ),
+        )
+
+        positions = input_batch.positions[:num_tokens]
+
+        self._known_req_ids.update(req_ids)
+
+        draft_tokens: torch.Tensor
+        if self._tp_rank == 0:
+            assert self._client is not None
+            idx = input_batch.idx_mapping[:num_reqs].long()
+            # 1D => batch-ordered bonus from model_runner.
+            # 2D [max_num_reqs, 1] => request-state table; take column 0 via idx.
+            # Never use last_sampled[idx] on a [max, 1] table without [..., 0]:
+            # packing a [num_reqs, 1] tensor historically confused consumers.
+            if last_sampled.dim() == 1:
+                ls = last_sampled[:num_reqs].to(dtype=torch.int64)
+            elif last_sampled.dim() == 2 and last_sampled.shape[-1] == 1:
+                ls = last_sampled[:, 0].index_select(0, idx).to(dtype=torch.int64)
+            else:
+                ls = last_sampled.reshape(-1).index_select(0, idx).to(dtype=torch.int64)
+
+            if next_prefill_tokens.dim() == 1:
+                if next_prefill_tokens.shape[0] == num_reqs:
+                    npf = next_prefill_tokens.to(dtype=torch.int64)
+                else:
+                    npf = next_prefill_tokens.index_select(0, idx).to(dtype=torch.int64)
+            else:
+                npf = (
+                    next_prefill_tokens.reshape(-1)
+                    .index_select(0, idx)
+                    .to(dtype=torch.int64)
+                )
+
+            ns = num_sampled[:num_reqs]
+            bonus = torch.where(ns > 0, ls, npf).reshape(-1)[:num_reqs].contiguous()
+
+            vocab = self.vllm_config.model_config.get_vocab_size()
+            oob = (bonus < 0) | (bonus >= vocab)
+            if bool(oob.any().item()):
+                # Prefer the first logit slot (combine wrote last_sampled there)
+                # over the rejected draft tail.
+                qsl = input_batch.query_start_loc
+                logits_indices = input_batch.logits_indices
+                cu = input_batch.cu_num_logits
+                before = bonus[oob][:8].detach().tolist()
+                for i in torch.nonzero(oob, as_tuple=False).view(-1).tolist():
+                    repaired = False
+                    if cu is not None and logits_indices is not None:
+                        logit0 = int(cu[i].item())
+                        tok = int(input_batch.input_ids[logits_indices[logit0]].item())
+                        if 0 <= tok < vocab:
+                            bonus[i] = tok
+                            repaired = True
+                    if not repaired:
+                        s = int(qsl[i].item())
+                        e = int(qsl[i + 1].item())
+                        n_rej = int(num_rejected[i].item())
+                        valid_e = e - n_rej
+                        if valid_e > s:
+                            tok = int(input_batch.input_ids[valid_e - 1].item())
+                            bonus[i] = tok if 0 <= tok < vocab else 0
+                        else:
+                            bonus[i] = 0
+                logger.warning(
+                    "Disagg-DFlash: repaired %d/%d OOB bonus tokens "
+                    "(vocab=%d); sample before=%s after=%s "
+                    "(248320==vocab_size is the top-k sentinel, not a token)",
+                    int(oob.sum().item()),
+                    num_reqs,
+                    vocab,
+                    before,
+                    bonus[oob][:8].detach().tolist(),
+                )
+
+            req = pack_speculate_request(
+                req_ids=req_ids,
+                reduced_hiddens=reduced,
+                positions=positions,
+                query_start_loc=input_batch.query_start_loc,
+                num_rejected=num_rejected,
+                # Force draft to take the last_sampled/bonus path.
+                num_sampled=torch.ones(num_reqs, dtype=torch.int32, device=bonus.device),
+                last_sampled=bonus,
+                next_prefill_tokens=bonus,
+                temperature=(
+                    temperature.index_select(0, idx)
+                    if temperature.numel() > num_reqs
+                    else temperature[:num_reqs]
+                ),
+                seeds=(
+                    seeds.index_select(0, idx)
+                    if seeds.numel() > num_reqs
+                    else seeds[:num_reqs]
+                ),
+                num_speculative_tokens=self.num_speculative_steps,
+                num_reqs=num_reqs,
+            )
+            resp = self._client.speculate(req)
+            draft_tokens = resp.draft_tokens.to(
+                device=self.device, dtype=torch.int64, non_blocking=True
+            )
+        else:
+            draft_tokens = torch.empty(
+                num_reqs,
+                self.num_speculative_steps,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+        if self._tp_size > 1:
+            torch.distributed.broadcast(
+                draft_tokens,
+                src=get_tp_group().ranks[0],
+                group=get_tp_group().device_group,
+            )
+
+        self.draft_tokens[:num_reqs].copy_(draft_tokens[:num_reqs])
+        return self.draft_tokens[:num_reqs]

@@ -297,6 +297,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
+            elif self.speculator is not None and hasattr(self.speculator, "load_model"):
+                # Disagg-DFlash proxy (and similar remote drafters).
+                self.speculator.load_model(self.model)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -308,7 +311,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
-            if self.speculator is not None:
+            if (
+                self.speculator is not None
+                and getattr(self.speculator, "model", None) is not None
+            ):
                 prepare_communication_buffer_for_model(self.speculator.model)
 
         # Initialize the components that require the model.
@@ -754,6 +760,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and finished_req_ids
         ):
             self.speculator.clear_drafter_context_lens(list(finished_req_ids))
+        # Free remote draft state here (not only in sample_tokens). Kernel
+        # warmup cleanup runs execute_model with finished_req_ids but never
+        # calls sample_tokens, which previously leaked Disagg-DFlash slots.
+        if (
+            finished_req_ids
+            and self.speculator is not None
+            and hasattr(self.speculator, "free_requests")
+        ):
+            self.speculator.free_requests(list(finished_req_ids))
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 

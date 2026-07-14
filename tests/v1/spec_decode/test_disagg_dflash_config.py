@@ -15,11 +15,14 @@ def _bare_spec_config(**kwargs) -> SpeculativeConfig:
     cfg = object.__new__(SpeculativeConfig)
     cfg.method = None
     cfg.disagg_spec_role = None
+    cfg.disagg_dflash_address = None
     cfg.num_speculative_tokens = 1
     cfg.use_heterogeneous_vocab = False
     cfg.draft_sample_method = "greedy"
     cfg.target_model_config = None
     cfg.draft_model_config = None
+    cfg.disagg_dflash_transport = "zmq"
+    cfg.disagg_dflash_ipc_max_num_tokens = None
     for k, v in kwargs.items():
         setattr(cfg, k, v)
     return cfg
@@ -91,8 +94,56 @@ def test_drafter_context_lens_seed_and_advance():
         assert t._drafter_context_lens["r2"] == 64
 
 
+def test_disagg_dflash_address_mutex_with_spec_role():
+    cfg = _bare_spec_config(
+        method="dflash",
+        num_speculative_tokens=4,
+        disagg_spec_role="producer",
+        disagg_dflash_address="tcp://127.0.0.1:50051",
+    )
+    if pytest is None:
+        try:
+            cfg._verify_args()
+            raise AssertionError("expected ValueError")
+        except ValueError as e:
+            assert "mutually exclusive" in str(e)
+        return
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cfg._verify_args()
+
+
+def test_use_disagg_dflash_helper():
+    cfg = _bare_spec_config(method="dflash", disagg_dflash_address=None)
+    assert cfg.use_disagg_dflash() is False
+    cfg.disagg_dflash_address = "tcp://127.0.0.1:50051"
+    assert cfg.use_disagg_dflash() is True
+
+
+def test_disagg_dflash_transport_default():
+    cfg = _bare_spec_config(
+        method="dflash",
+        disagg_dflash_address="tcp://127.0.0.1:50051",
+        disagg_dflash_transport="zmq",
+    )
+    # Defaults are fields on a real instance; bare object needs attrs set.
+    assert cfg.disagg_dflash_transport == "zmq"
+    cfg.disagg_dflash_transport = "nccl"
+    if pytest is None:
+        try:
+            cfg._verify_args()
+            raise AssertionError("expected ValueError")
+        except ValueError as e:
+            assert "not implemented" in str(e)
+        return
+    with pytest.raises(ValueError, match="not implemented"):
+        cfg._verify_args()
+
+
 if __name__ == "__main__":
     test_disagg_spec_role_helpers()
     test_disagg_spec_role_rejects_non_dflash()
     test_drafter_context_lens_seed_and_advance()
+    test_disagg_dflash_address_mutex_with_spec_role()
+    test_use_disagg_dflash_helper()
+    test_disagg_dflash_transport_default()
     print("ok")
