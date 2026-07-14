@@ -96,7 +96,11 @@ Omit `disagg_dflash_address` — same as stock DFlash.
   postprocess so that work overlaps the ZMQ RTT (Stage 2).
 - Draft engine keeps speculate meta on CPU (no per-req CUDA `.item()` syncs)
   and vectorizes block-table updates.
-- Cross-step pipeline (optional): `VLLM_DISAGG_DFLASH_CROSS_STEP=1` defers
-  `propose_finish` into the next `execute_model` so draft RTT overlaps
-  schedule / prepare (disabled for structured-output batches).
+- Cross-step pipeline (default ON): `VLLM_DISAGG_DFLASH_CROSS_STEP=0` to
+  disable. Defers `propose_finish` into the next `execute_model` so draft
+  RTT overlaps schedule / prepare (skipped for structured-output batches).
+  When deferred, profiles should show large `verify_overlap_ms`.
+- Projector runs on a side stream under rejection sampling (`begin_reduce`).
+- Draft-side phases: `VLLM_DISAGG_DFLASH_DRAFT_PROFILE=1` on the draft
+  server (`prep_ms` / `kv_ms` / `forward_ms` / …).
 - Experimental; validate acceptance length vs colocated DFlash before production use.

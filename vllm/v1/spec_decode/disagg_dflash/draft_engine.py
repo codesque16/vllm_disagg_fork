@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections import deque
 from typing import Any
 
@@ -59,6 +60,10 @@ from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import prepare_kernel_block_sizes
 
 logger = init_logger(__name__)
+
+def _draft_profile_enabled() -> bool:
+    return os.environ.get("VLLM_DISAGG_DFLASH_DRAFT_PROFILE", "0") == "1"
+
 
 
 def _iter_weights(model_path: str, revision: str | None = None):
@@ -596,6 +601,10 @@ class DisaggDFlashDraftEngine:
     ) -> DisaggDFlashSpeculateResponse:
         num_reqs = len(request.req_ids)
         device = self.device
+        profile = _draft_profile_enabled()
+        t0 = time.perf_counter() if profile else 0.0
+        t_q = t0
+        phase: dict[str, float] = {}
 
         # Hiddens / positions needed on GPU for KV write. Meta tensors stay on
         # host — decoding already produced CPU tensors; uploading then .item()
@@ -713,11 +722,19 @@ class DisaggDFlashDraftEngine:
                     else group_slots[0]
                     for name in layer_names
                 ]
+            if profile:
+                torch.cuda.synchronize()
+                phase["prep_ms"] = (time.perf_counter() - t0) * 1000.0
+                t_kv = time.perf_counter()
             self.model.precompute_and_store_context_kv(
                 ctx_h,
                 ctx_pos_gpu,
                 context_slots,
             )
+            if profile:
+                torch.cuda.synchronize()
+                phase["kv_ms"] = (time.perf_counter() - t_kv) * 1000.0
+                t_q = time.perf_counter()
 
         # Build query tokens: bonus + mask tokens (batched GPU fills).
         num_query = num_reqs * self.num_query_per_req
@@ -848,6 +865,10 @@ class DisaggDFlashDraftEngine:
         )
 
         batch_descriptor = BatchDescriptor(num_tokens=num_query)
+        if profile:
+            torch.cuda.synchronize()
+            phase["query_prep_ms"] = (time.perf_counter() - t_q) * 1000.0
+            t_fwd = time.perf_counter()
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
@@ -860,6 +881,10 @@ class DisaggDFlashDraftEngine:
                 positions=self.input_buffers.positions[:num_query],
                 inputs_embeds=None,
             )
+        if profile:
+            torch.cuda.synchronize()
+            phase["forward_ms"] = (time.perf_counter() - t_fwd) * 1000.0
+            t_sample = time.perf_counter()
 
         # Sample from mask-token positions (skip bonus at offset 0).
         if num_reqs > 0:
@@ -876,6 +901,20 @@ class DisaggDFlashDraftEngine:
         logits = self.model.compute_logits(hidden[sample_idx_t])
         tokens = logits.argmax(dim=-1).view(num_reqs, self.num_speculative_tokens)
         self.draft_tokens[:num_reqs].copy_(tokens)
+        if profile:
+            torch.cuda.synchronize()
+            phase["sample_ms"] = (time.perf_counter() - t_sample) * 1000.0
+            phase["total_ms"] = (time.perf_counter() - t0) * 1000.0
+            if not hasattr(self, "_draft_profile_steps"):
+                self._draft_profile_steps = 0
+            self._draft_profile_steps += 1
+            every = int(os.environ.get("VLLM_DISAGG_DFLASH_DRAFT_PROFILE_EVERY", "20"))
+            if self._draft_profile_steps % max(1, every) == 0:
+                logger.info(
+                    "Disagg-DFlash draft profile (n=%d): %s",
+                    num_reqs,
+                    {k: round(v, 2) for k, v in phase.items()},
+                )
 
         if request.payload_mode == PAYLOAD_IPC:
             staging = self.ensure_ipc_staging()

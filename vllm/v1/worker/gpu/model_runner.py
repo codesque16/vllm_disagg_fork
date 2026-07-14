@@ -1142,12 +1142,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
-            # Cross-step Disagg-DFlash: finish previous fire before FREE /
-            # prepare_inputs so draft tokens land in fire-time req slots.
+            # Cross-step: run PP update (CPU) first, then finish the deferred
+            # draft RTT so more of the schedule→execute gap is under the wait.
+            self.update_pp_decode_requests()
             if isinstance(self.speculator, DisaggDFlashProxy):
                 self.speculator.drain_deferred(self.req_states)
-            # Update the request states.
-            self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
@@ -1415,6 +1414,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
+        # Start Disagg projector early so L*H→H runs under rejection sampling.
+        if isinstance(self.speculator, DisaggDFlashProxy):
+            spec_hidden_states = hidden_states
+            if hasattr(self.model, "get_mtp_target_hidden_states"):
+                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            self.speculator.begin_reduce(
+                spec_hidden_states,
+                aux_hidden_states,
+                input_batch.num_tokens,
+            )
+
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
@@ -1433,17 +1444,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         disagg_pending = None
         if isinstance(self.speculator, DisaggDFlashProxy):
             assert self.sampler is not None
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             # Pass sampler output (batch-local) so bonus tokens do not depend on
             # postprocess updating req_states.last_sampled_tokens.
+            # Projector was launched in begin_reduce above.
             disagg_pending = self.speculator.propose_begin(
                 input_batch,
                 attn_metadata,
                 slot_mappings_by_layer,
-                spec_hidden_states,
+                hidden_states,
                 aux_hidden_states,
                 num_sampled,
                 num_rejected,

@@ -44,7 +44,10 @@ def _profile_enabled() -> bool:
 
 
 def _cross_step_enabled() -> bool:
-    return os.environ.get("VLLM_DISAGG_DFLASH_CROSS_STEP", "0") == "1"
+    # Default ON: defer propose_finish into the next execute_model so draft
+    # RTT overlaps EngineCore / schedule / preamble. Set to 0 to force
+    # in-step begin+finish (Stage 2 only).
+    return os.environ.get("VLLM_DISAGG_DFLASH_CROSS_STEP", "1") != "0"
 
 
 @dataclass
@@ -94,6 +97,13 @@ class DisaggDFlashProxy(BaseSpeculator):
         # Cross-step: one in-flight speculate whose finish is deferred into the
         # next execute_model (before FREE / prepare_inputs).
         self._deferred_pending: DisaggProposePending | None = None
+        # Side-stream projector so reduce_aux can run under rejection sampling.
+        self._proj_stream = torch.cuda.Stream(device=device)
+        self._proj_ready = torch.cuda.Event(enable_timing=False)
+        self._proj_reduced: torch.Tensor | None = None
+        self._proj_num_tokens: int = 0
+        self._proj_t0: float = 0.0
+        self._proj_inflight: bool = False
 
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
@@ -149,6 +159,46 @@ class DisaggDFlashProxy(BaseSpeculator):
         block_tables: BlockTables,
     ) -> None:
         return
+
+    def begin_reduce(
+        self,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_tokens: int,
+    ) -> None:
+        """Launch L*H→H projector on a side stream (overlaps with sample())."""
+        if self._projector is None:
+            self._proj_inflight = False
+            self._proj_reduced = last_hidden_states[:num_tokens]
+            self._proj_num_tokens = num_tokens
+            return
+        profile = _profile_enabled() and self._tp_rank == 0
+        self._proj_t0 = time.perf_counter() if profile else 0.0
+        self._proj_num_tokens = num_tokens
+        self._proj_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(self._proj_stream):
+            self._proj_reduced = reduce_aux_hidden_states(
+                self._projector,
+                last_hidden_states[:num_tokens],
+                (
+                    [h[:num_tokens] for h in aux_hidden_states]
+                    if aux_hidden_states is not None
+                    else None
+                ),
+            )
+        self._proj_ready.record(self._proj_stream)
+        self._proj_inflight = True
+
+    def _take_reduced(self, profile: bool) -> tuple[torch.Tensor, float, float]:
+        """Wait for side-stream reduce (or no-op) and return (tensor, t0, t1)."""
+        t0 = self._proj_t0 if profile else 0.0
+        if self._proj_inflight:
+            self._proj_ready.synchronize()
+            torch.cuda.current_stream(self.device).wait_stream(self._proj_stream)
+            self._proj_inflight = False
+        t1 = time.perf_counter() if profile else 0.0
+        assert self._proj_reduced is not None
+        return self._proj_reduced, t0, t1
 
     def free_requests(self, req_ids: list[str]) -> None:
         if not req_ids:
@@ -340,20 +390,30 @@ class DisaggDFlashProxy(BaseSpeculator):
 
         num_tokens = input_batch.num_tokens
         profile = _profile_enabled() and self._tp_rank == 0
-        t_proj0 = time.perf_counter() if profile else 0.0
-        reduced = reduce_aux_hidden_states(
-            self._projector,
-            last_hidden_states[:num_tokens],
-            (
-                [h[:num_tokens] for h in aux_hidden_states]
-                if aux_hidden_states is not None
-                else None
-            ),
-        )
-        if profile:
-            # Ensure projector GPU work finished before measuring.
-            torch.cuda.synchronize()
-        t_proj1 = time.perf_counter() if profile else 0.0
+        if (
+            self._proj_inflight
+            or self._proj_reduced is not None
+        ) and self._proj_num_tokens == num_tokens:
+            reduced, t_proj0, t_proj1 = self._take_reduced(profile)
+        else:
+            if self._proj_inflight:
+                # Stale async reduce (token count changed); wait & drop.
+                self._proj_ready.synchronize()
+                self._proj_inflight = False
+            t_proj0 = time.perf_counter() if profile else 0.0
+            reduced = reduce_aux_hidden_states(
+                self._projector,
+                last_hidden_states[:num_tokens],
+                (
+                    [h[:num_tokens] for h in aux_hidden_states]
+                    if aux_hidden_states is not None
+                    else None
+                ),
+            )
+            if profile:
+                torch.cuda.synchronize()
+            t_proj1 = time.perf_counter() if profile else 0.0
+        self._proj_reduced = None
 
         positions = input_batch.positions[:num_tokens]
         self._known_req_ids.update(req_ids)
@@ -469,9 +529,10 @@ class DisaggDFlashProxy(BaseSpeculator):
             self._profile_steps += 1
             if self._profile_steps % max(1, self._profile_every) == 0:
                 logger.info(
-                    "Disagg-DFlash profile (n=%d transport=%s): %s",
+                    "Disagg-DFlash profile (n=%d transport=%s cross_step=%s): %s",
                     num_reqs,
                     self._transport_name,
+                    self._cross_step,
                     {k: round(v, 2) for k, v in speculate_ms.items()},
                 )
 
